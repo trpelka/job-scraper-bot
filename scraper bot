@@ -1,92 +1,114 @@
-# 1. INSTALL DEPENDENCIES SILENTLY
-!pip install -q python-jobspy pandas
-
-# 2. SYSTEM-LEVEL GEOCODER MOCK
-# Forces JobSpy to treat IP location as 'usa' to bypass regional validation crashes
+import sqlite3
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
-mock_geocoder = MagicMock()
-mock_ip_obj = MagicMock()
-mock_ip_obj.country = "usa"
-mock_geocoder.ip.return_value = mock_ip_obj
-sys.modules["geocoder"] = mock_geocoder
-
-# 3. CORE APPLICATION & DATABASE
-import sqlite3
 import pandas as pd
 from jobspy import scrape_jobs
 
-# Search Settings (Adjust these freely)
+
 SEARCH_TERM = "Python Developer"
 LOCATION = "Remote"
 RESULTS_WANTED = 10
 HOURS_OLD = 48
 SITES = ["linkedin", "indeed", "glassdoor"]
+COUNTRY_INDEED = "usa"
 
-# Initialize local SQLite database for deduplication
-conn = sqlite3.connect("local_jobs.db")
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS seen_jobs (
-    job_url TEXT PRIMARY KEY,
-    title TEXT,
-    company TEXT,
-    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-""")
-conn.commit()
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATABASE = BASE_DIR / "local_jobs.db"
 
-def is_job_seen(job_url: str) -> bool:
-    cursor.execute("SELECT 1 FROM seen_jobs WHERE job_url = ?", (job_url,))
-    return cursor.fetchone() is not None
 
-def mark_job_seen(job_url: str, title: str, company: str):
-    cursor.execute(
-        "INSERT OR IGNORE INTO seen_jobs (job_url, title, company) VALUES (?, ?, ?)",
-        (job_url, title, company)
-    )
-    conn.commit()
+def configure_geocoder():
+    geocoder = MagicMock()
+    ip_result = MagicMock()
+    ip_result.country = COUNTRY_INDEED
+    geocoder.ip.return_value = ip_result
+    sys.modules["geocoder"] = geocoder
 
-def run_search():
-    print(f"🔎 Searching {SITES} for '{SEARCH_TERM}' in '{LOCATION}'...\n")
-    
-    try:
-        jobs: pd.DataFrame = scrape_jobs(
-            site_name=SITES,
-            search_term=SEARCH_TERM,
-            location=LOCATION,
-            results_wanted=RESULTS_WANTED,
-            hours_old=HOURS_OLD,
-            country_indeed='usa'
+
+def initialize_database():
+    connection = sqlite3.connect(DATABASE)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS seen_jobs (
+            job_url TEXT PRIMARY KEY,
+            title TEXT,
+            company TEXT,
+            found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+    connection.commit()
+    return connection
 
-        if jobs is None or jobs.empty:
-            print("No new jobs found for these criteria.")
-            return
 
-        new_count = 0
+def job_seen(connection, job_url):
+    result = connection.execute(
+        "SELECT 1 FROM seen_jobs WHERE job_url = ?",
+        (job_url,),
+    ).fetchone()
+
+    return result is not None
+
+
+def save_job(connection, job_url, title, company):
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO seen_jobs
+        (job_url, title, company)
+        VALUES (?, ?, ?)
+        """,
+        (job_url, title, company),
+    )
+    connection.commit()
+
+
+def scrape():
+    print(
+        f"Searching {SITES} for '{SEARCH_TERM}' "
+        f"in '{LOCATION}'..."
+    )
+
+    jobs: pd.DataFrame = scrape_jobs(
+        site_name=SITES,
+        search_term=SEARCH_TERM,
+        location=LOCATION,
+        results_wanted=RESULTS_WANTED,
+        hours_old=HOURS_OLD,
+        country_indeed=COUNTRY_INDEED,
+    )
+
+    if jobs is None or jobs.empty:
+        print("No jobs found.")
+        return
+
+    connection = initialize_database()
+    new_jobs = 0
+
+    try:
         for _, row in jobs.iterrows():
-            job_url = str(row.get("job_url", ""))
-            title = str(row.get("title", "N/A"))
-            company = str(row.get("company", "N/A"))
-            loc = str(row.get("location", "N/A"))
-            site = str(row.get("site", "N/A")).capitalize()
+            job_url = str(row.get("job_url", "")).strip()
 
-            if not job_url or is_job_seen(job_url):
+            if not job_url or job_seen(connection, job_url):
                 continue
 
-            print(f"📌 [{site}] {title}")
-            print(f"   🏢 Company: {company} | 📍 Location: {loc}")
-            print(f"   🔗 Link: {job_url}\n" + "-"*50)
+            title = str(row.get("title", "N/A"))
+            company = str(row.get("company", "N/A"))
+            location = str(row.get("location", "N/A"))
+            site = str(row.get("site", "N/A")).capitalize()
 
-            mark_job_seen(job_url, title, company)
-            new_count += 1
+            print(f"\n[{site}] {title}")
+            print(f"Company: {company}")
+            print(f"Location: {location}")
+            print(f"URL: {job_url}")
 
-        print(f"\n✅ Done! Printed {new_count} new un-seen job listings.")
+            save_job(connection, job_url, title, company)
+            new_jobs += 1
 
-    except Exception as e:
-        print(f"⚠️ Search error: {e}")
+    finally:
+        connection.close()
+
+    print(f"\nFound {new_jobs} new jobs.")
+
 
 if __name__ == "__main__":
-    run_search()
+    configure_geocoder()
+    scrape()
