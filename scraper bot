@@ -1,26 +1,30 @@
+# 1. INSTALL DEPENDENCIES SILENTLY
+!pip install -q python-jobspy pandas
+
+# 2. SYSTEM-LEVEL GEOCODER MOCK
+# Forces JobSpy to treat IP location as 'usa' to bypass regional validation crashes
 import sys
 from unittest.mock import MagicMock
 
-# 1. TRICK GEOCODER BEFORE JOBSPY IMPORTS IT
-# Create a fake geocoder module that returns 'usa' for any IP lookup
 mock_geocoder = MagicMock()
 mock_ip_obj = MagicMock()
 mock_ip_obj.country = "usa"
 mock_geocoder.ip.return_value = mock_ip_obj
-
-# Inject the mock directly into Python's loaded system modules
 sys.modules["geocoder"] = mock_geocoder
 
-# 2. NOW IMPORT JOBSPY (it will read our fake 'usa' location)
+# 3. CORE APPLICATION & DATABASE
 import sqlite3
 import pandas as pd
 from jobspy import scrape_jobs
 
+# Search Settings (Adjust these freely)
 SEARCH_TERM = "Python Developer"
 LOCATION = "Remote"
 RESULTS_WANTED = 10
+HOURS_OLD = 48
+SITES = ["linkedin", "indeed", "glassdoor"]
 
-# Database setup for deduplication
+# Initialize local SQLite database for deduplication
 conn = sqlite3.connect("local_jobs.db")
 cursor = conn.cursor()
 cursor.execute("""
@@ -45,21 +49,20 @@ def mark_job_seen(job_url: str, title: str, company: str):
     conn.commit()
 
 def run_search():
-    print(f"🔎 Searching for '{SEARCH_TERM}' in '{LOCATION}'...\n")
+    print(f"🔎 Searching {SITES} for '{SEARCH_TERM}' in '{LOCATION}'...\n")
     
     try:
-        # Now you can use LinkedIn, Indeed, Glassdoor, etc. without crashes
         jobs: pd.DataFrame = scrape_jobs(
-            site_name=["linkedin", "indeed", "glassdoor"],
+            site_name=SITES,
             search_term=SEARCH_TERM,
             location=LOCATION,
             results_wanted=RESULTS_WANTED,
-            hours_old=48,
+            hours_old=HOURS_OLD,
             country_indeed='usa'
         )
 
         if jobs is None or jobs.empty:
-            print("No new jobs found.")
+            print("No new jobs found for these criteria.")
             return
 
         new_count = 0
@@ -80,7 +83,7 @@ def run_search():
             mark_job_seen(job_url, title, company)
             new_count += 1
 
-        print(f"\n✅ Done! Printed {new_count} new job listings.")
+        print(f"\n✅ Done! Printed {new_count} new un-seen job listings.")
 
     except Exception as e:
         print(f"⚠️ Search error: {e}")
