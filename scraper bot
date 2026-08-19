@@ -1,10 +1,10 @@
+```python
 import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
-from jobspy import scrape_jobs
 
 
 SEARCH_TERM = "Python Developer"
@@ -28,6 +28,7 @@ def configure_geocoder():
 
 def initialize_database():
     connection = sqlite3.connect(DATABASE)
+
     connection.execute("""
         CREATE TABLE IF NOT EXISTS seen_jobs (
             job_url TEXT PRIMARY KEY,
@@ -36,17 +37,16 @@ def initialize_database():
             found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     connection.commit()
     return connection
 
 
 def job_seen(connection, job_url):
-    result = connection.execute(
+    return connection.execute(
         "SELECT 1 FROM seen_jobs WHERE job_url = ?",
         (job_url,),
-    ).fetchone()
-
-    return result is not None
+    ).fetchone() is not None
 
 
 def save_job(connection, job_url, title, company):
@@ -62,10 +62,9 @@ def save_job(connection, job_url, title, company):
 
 
 def scrape():
-    print(
-        f"Searching {SITES} for '{SEARCH_TERM}' "
-        f"in '{LOCATION}'..."
-    )
+    from jobspy import scrape_jobs
+
+    print(f"Searching {SITES} for '{SEARCH_TERM}' in '{LOCATION}'...")
 
     jobs: pd.DataFrame = scrape_jobs(
         site_name=SITES,
@@ -112,3 +111,4 @@ def scrape():
 if __name__ == "__main__":
     configure_geocoder()
     scrape()
+```
