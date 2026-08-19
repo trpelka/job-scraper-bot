@@ -1,0 +1,89 @@
+import sys
+from unittest.mock import MagicMock
+
+# 1. TRICK GEOCODER BEFORE JOBSPY IMPORTS IT
+# Create a fake geocoder module that returns 'usa' for any IP lookup
+mock_geocoder = MagicMock()
+mock_ip_obj = MagicMock()
+mock_ip_obj.country = "usa"
+mock_geocoder.ip.return_value = mock_ip_obj
+
+# Inject the mock directly into Python's loaded system modules
+sys.modules["geocoder"] = mock_geocoder
+
+# 2. NOW IMPORT JOBSPY (it will read our fake 'usa' location)
+import sqlite3
+import pandas as pd
+from jobspy import scrape_jobs
+
+SEARCH_TERM = "Python Developer"
+LOCATION = "Remote"
+RESULTS_WANTED = 10
+
+# Database setup for deduplication
+conn = sqlite3.connect("local_jobs.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS seen_jobs (
+    job_url TEXT PRIMARY KEY,
+    title TEXT,
+    company TEXT,
+    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+""")
+conn.commit()
+
+def is_job_seen(job_url: str) -> bool:
+    cursor.execute("SELECT 1 FROM seen_jobs WHERE job_url = ?", (job_url,))
+    return cursor.fetchone() is not None
+
+def mark_job_seen(job_url: str, title: str, company: str):
+    cursor.execute(
+        "INSERT OR IGNORE INTO seen_jobs (job_url, title, company) VALUES (?, ?, ?)",
+        (job_url, title, company)
+    )
+    conn.commit()
+
+def run_search():
+    print(f"🔎 Searching for '{SEARCH_TERM}' in '{LOCATION}'...\n")
+    
+    try:
+        # Now you can use LinkedIn, Indeed, Glassdoor, etc. without crashes
+        jobs: pd.DataFrame = scrape_jobs(
+            site_name=["linkedin", "indeed", "glassdoor"],
+            search_term=SEARCH_TERM,
+            location=LOCATION,
+            results_wanted=RESULTS_WANTED,
+            hours_old=48,
+            country_indeed='usa'
+        )
+
+        if jobs is None or jobs.empty:
+            print("No new jobs found.")
+            return
+
+        new_count = 0
+        for _, row in jobs.iterrows():
+            job_url = str(row.get("job_url", ""))
+            title = str(row.get("title", "N/A"))
+            company = str(row.get("company", "N/A"))
+            loc = str(row.get("location", "N/A"))
+            site = str(row.get("site", "N/A")).capitalize()
+
+            if not job_url or is_job_seen(job_url):
+                continue
+
+            print(f"📌 [{site}] {title}")
+            print(f"   🏢 Company: {company} | 📍 Location: {loc}")
+            print(f"   🔗 Link: {job_url}\n" + "-"*50)
+
+            mark_job_seen(job_url, title, company)
+            new_count += 1
+
+        print(f"\n✅ Done! Printed {new_count} new job listings.")
+
+    except Exception as e:
+        print(f"⚠️ Search error: {e}")
+
+if __name__ == "__main__":
+    run_search()
