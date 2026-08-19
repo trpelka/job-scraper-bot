@@ -10,11 +10,10 @@ SEARCH_TERM = "Python Developer"
 LOCATION = "Remote"
 RESULTS_WANTED = 10
 HOURS_OLD = 48
-SITES = ["linkedin", "indeed", "glassdoor"]
+SITES = ["linkedin", "indeed"]
 COUNTRY_INDEED = "usa"
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE = BASE_DIR / "local_jobs.db"
+DATABASE = Path(__file__).resolve().parent / "local_jobs.db"
 
 
 def configure_geocoder():
@@ -62,51 +61,67 @@ def save_job(connection, job_url, title, company):
     connection.commit()
 
 
-def scrape():
+def scrape_site(site, connection):
     from jobspy import scrape_jobs
 
-    print(f"Searching {SITES} for '{SEARCH_TERM}' in '{LOCATION}'...")
-
-    jobs: pd.DataFrame = scrape_jobs(
-        site_name=SITES,
-        search_term=SEARCH_TERM,
-        location=LOCATION,
-        results_wanted=RESULTS_WANTED,
-        hours_old=HOURS_OLD,
-        country_indeed=COUNTRY_INDEED,
-    )
-
-    if jobs is None or jobs.empty:
-        print("No jobs found.")
-        return
-
-    connection = initialize_database()
-    new_jobs = 0
+    print(f"\nSearching {site}...")
 
     try:
-        for _, row in jobs.iterrows():
-            job_url = str(row.get("job_url", "")).strip()
+        jobs: pd.DataFrame = scrape_jobs(
+            site_name=site,
+            search_term=SEARCH_TERM,
+            location=LOCATION,
+            results_wanted=RESULTS_WANTED,
+            hours_old=HOURS_OLD,
+            country_indeed=COUNTRY_INDEED,
+        )
+    except Exception as error:
+        print(f"{site} failed: {error}")
+        return 0
 
-            if not job_url or job_seen(connection, job_url):
-                continue
+    if jobs is None or jobs.empty:
+        print(f"No jobs found on {site}.")
+        return 0
 
-            title = str(row.get("title", "N/A"))
-            company = str(row.get("company", "N/A"))
-            location = str(row.get("location", "N/A"))
-            site = str(row.get("site", "N/A")).capitalize()
+    new_jobs = 0
 
-            print(f"\n[{site}] {title}")
-            print(f"Company: {company}")
-            print(f"Location: {location}")
-            print(f"URL: {job_url}")
+    for _, row in jobs.iterrows():
+        job_url = str(row.get("job_url", "")).strip()
 
-            save_job(connection, job_url, title, company)
-            new_jobs += 1
+        if not job_url or job_seen(connection, job_url):
+            continue
 
+        title = str(row.get("title", "N/A"))
+        company = str(row.get("company", "N/A"))
+        location = str(row.get("location", "N/A"))
+
+        print(f"\n[{site.capitalize()}] {title}")
+        print(f"Company: {company}")
+        print(f"Location: {location}")
+        print(f"URL: {job_url}")
+
+        save_job(connection, job_url, title, company)
+        new_jobs += 1
+
+    return new_jobs
+
+
+def scrape():
+    print(
+        f"Searching for '{SEARCH_TERM}' "
+        f"in '{LOCATION}'..."
+    )
+
+    connection = initialize_database()
+    total_new_jobs = 0
+
+    try:
+        for site in SITES:
+            total_new_jobs += scrape_site(site, connection)
     finally:
         connection.close()
 
-    print(f"\nFound {new_jobs} new jobs.")
+    print(f"\nFinished. Found {total_new_jobs} new jobs.")
 
 
 if __name__ == "__main__":
