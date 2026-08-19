@@ -1,3 +1,4 @@
+import csv
 import sqlite3
 import sys
 from pathlib import Path
@@ -13,7 +14,9 @@ HOURS_OLD = 48
 SITES = ["linkedin", "indeed"]
 COUNTRY_INDEED = "usa"
 
-DATABASE = Path(__file__).resolve().parent / "local_jobs.db"
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE = BASE_DIR / "local_jobs.db"
+CSV_FILE = BASE_DIR / "jobs.csv"
 
 
 def configure_geocoder():
@@ -33,6 +36,8 @@ def initialize_database():
             job_url TEXT PRIMARY KEY,
             title TEXT,
             company TEXT,
+            location TEXT,
+            site TEXT,
             found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -49,14 +54,14 @@ def job_seen(connection, job_url):
     ).fetchone() is not None
 
 
-def save_job(connection, job_url, title, company):
+def save_job(connection, job_url, title, company, location, site):
     connection.execute(
         """
         INSERT OR IGNORE INTO seen_jobs
-        (job_url, title, company)
-        VALUES (?, ?, ?)
+        (job_url, title, company, location, site)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (job_url, title, company),
+        (job_url, title, company, location, site),
     )
     connection.commit()
 
@@ -77,13 +82,13 @@ def scrape_site(site, connection):
         )
     except Exception as error:
         print(f"{site} failed: {error}")
-        return 0
+        return []
 
     if jobs is None or jobs.empty:
         print(f"No jobs found on {site}.")
-        return 0
+        return []
 
-    new_jobs = 0
+    new_jobs = []
 
     for _, row in jobs.iterrows():
         job_url = str(row.get("job_url", "")).strip()
@@ -91,19 +96,85 @@ def scrape_site(site, connection):
         if not job_url or job_seen(connection, job_url):
             continue
 
-        title = str(row.get("title", "N/A"))
-        company = str(row.get("company", "N/A"))
-        location = str(row.get("location", "N/A"))
+        title = str(row.get("title", "N/A")).strip()
+        company = str(row.get("company", "N/A")).strip()
+        location = str(row.get("location", "N/A")).strip()
+        site_name = str(row.get("site", site)).strip().capitalize()
 
-        print(f"\n[{site.capitalize()}] {title}")
+        save_job(
+            connection,
+            job_url,
+            title,
+            company,
+            location,
+            site_name,
+        )
+
+        new_jobs.append(
+            {
+                "title": title,
+                "company": company,
+                "location": location,
+                "site": site_name,
+                "job_url": job_url,
+            }
+        )
+
+        print(f"\n[{site_name}] {title}")
         print(f"Company: {company}")
         print(f"Location: {location}")
         print(f"URL: {job_url}")
 
-        save_job(connection, job_url, title, company)
-        new_jobs += 1
-
     return new_jobs
+
+
+def write_csv(jobs):
+    fieldnames = [
+        "title",
+        "company",
+        "location",
+        "site",
+        "job_url",
+    ]
+
+    existing_jobs = []
+
+    if CSV_FILE.exists():
+        with CSV_FILE.open(
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+            reader = csv.DictReader(file)
+            existing_jobs = list(reader)
+
+    existing_urls = {
+        job.get("job_url", "")
+        for job in existing_jobs
+    }
+
+    all_jobs = existing_jobs
+
+    for job in jobs:
+        if job["job_url"] not in existing_urls:
+            all_jobs.append(job)
+            existing_urls.add(job["job_url"])
+
+    with CSV_FILE.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+        writer.writerows(all_jobs)
+
+    print(f"\nCSV saved: {CSV_FILE}")
+    print(f"Total jobs in CSV: {len(all_jobs)}")
 
 
 def scrape():
@@ -113,15 +184,24 @@ def scrape():
     )
 
     connection = initialize_database()
-    total_new_jobs = 0
+    all_new_jobs = []
 
     try:
         for site in SITES:
-            total_new_jobs += scrape_site(site, connection)
+            new_jobs = scrape_site(
+                site,
+                connection,
+            )
+            all_new_jobs.extend(new_jobs)
     finally:
         connection.close()
 
-    print(f"\nFinished. Found {total_new_jobs} new jobs.")
+    write_csv(all_new_jobs)
+
+    print(
+        f"\nFinished. "
+        f"Found {len(all_new_jobs)} new jobs."
+    )
 
 
 if __name__ == "__main__":
