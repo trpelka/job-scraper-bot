@@ -1,4 +1,3 @@
-```python
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,7 +13,7 @@ HOURS_OLD = 48
 SITES = ["linkedin", "indeed", "glassdoor"]
 COUNTRY_INDEED = "usa"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "local_jobs.db"
 
 
@@ -29,14 +28,16 @@ def configure_geocoder():
 def initialize_database():
     connection = sqlite3.connect(DATABASE)
 
-    connection.execute("""
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS seen_jobs (
             job_url TEXT PRIMARY KEY,
             title TEXT,
             company TEXT,
             found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+        """
+    )
 
     connection.commit()
     return connection
@@ -111,4 +112,3 @@ def scrape():
 if __name__ == "__main__":
     configure_geocoder()
     scrape()
-```
