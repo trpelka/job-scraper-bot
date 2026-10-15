@@ -1,19 +1,18 @@
 """
 Remote OSINT / AML-KYC / language-analyst job scraper, EU-eligible roles only.
 
-Sources (each can be switched off in SOURCES):
-  jobspy    LinkedIn, Indeed (12 EU countries incl. Poland), Glassdoor (8 EU countries), HelloWork (France)
-  adzuna    API, needs free key  -> env ADZUNA_APP_ID, ADZUNA_APP_KEY   (indexes many Polish portals)
-  jooble    API, needs free key  -> env JOOBLE_API_KEY                  (aggregates many Polish portals)
-  arbeitnow API, no key (Germany/EU, remote flag)
-  remotive  API, no key (remote jobs, max 4 calls/day per Remotive's rules)
+Sources (no accounts or API keys needed):
+  portals_pl Pracuj.pl, JustJoin.it, RocketJobs.pl, Jooble.pl (public search pages)
+  jobspy    Indeed (12 EU countries incl. Poland), LinkedIn, optional Glassdoor / HelloWork
+  arbeitnow public API, Germany/EU, remote flag
+  remotive  public API, remote jobs
 
 Run once:      python job_scraper.py
 Run 2x daily:  python job_scraper.py --daemon        (08:00 and 18:00 local time)
 or cron:       0 8,18 * * *  /usr/bin/python3 /path/to/job_scraper.py
 Windows:       Task Scheduler, two daily triggers running the same command.
 
-pip install -U python-jobspy pandas requests
+pip install -U python-jobspy pandas requests beautifulsoup4
 """
 import argparse
 import csv
@@ -29,9 +28,15 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import requests
+from urllib.parse import quote, urljoin
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:          # portals_pl needs: pip install beautifulsoup4
+    BeautifulSoup = None
 
 # ---------------------------------------------------------------- settings
-SOURCES = ["jobspy", "adzuna", "jooble", "arbeitnow", "remotive"]
+SOURCES = ["jobspy", "portals_pl", "arbeitnow", "remotive"]
 
 # JobSpy boolean queries (one call covers many terms)
 BOOLEAN_QUERIES = [
@@ -46,21 +51,23 @@ LOCAL_QUERIES = {
     "germany": ['"Geldwäsche" OR "Compliance Analyst" OR "Sanktionen" OR "Ermittler"'],
     "france": ['"analyste LCB-FT" OR "analyste conformité" OR "KYC" OR "analyste renseignement"'],
 }
-# Plain keyword list for APIs without boolean support (Jooble)
-SIMPLE_TERMS = ["OSINT analyst", "AML analyst", "KYC analyst", "due diligence analyst",
-                "sanctions analyst", "financial crime analyst", "language analyst",
-                "analityk OSINT", "analityk AML", "specjalista KYC", "tłumacz zdalnie"]
 
-LINKEDIN_LOCATIONS = ["European Union", "Poland", "Germany", "Netherlands", "Ireland", "Spain"]
+LINKEDIN_LOCATIONS = ["Poland", "European Union", "Germany"]
 INDEED_COUNTRIES = ["poland", "germany", "netherlands", "ireland", "spain", "france",
                     "belgium", "austria", "portugal", "italy", "czech republic", "romania"]
 GLASSDOOR_COUNTRIES = ["germany", "netherlands", "ireland", "spain", "france", "belgium", "austria", "italy"]
-ADZUNA_COUNTRIES = ["pl", "de", "nl", "fr", "es", "it", "at", "be"]   # check pl at developer.adzuna.com
-JOOBLE_LOCATIONS = ["Poland"]
 
+# JobSpy boards. LinkedIn (429) and Glassdoor (403) block datacenter IPs such as GitHub Actions runners:
+# they work from a home connection or with proxies (env JOBSPY_PROXIES="user:pass@host:port,..."), so
+# Glassdoor is off by default and LinkedIn is limited.
+JOBSPY_SITES = ["indeed", "linkedin"]          # add "glassdoor" / "hellowork" if you run locally or use proxies
+PROXIES = [p.strip() for p in os.getenv("JOBSPY_PROXIES", "").split(",") if p.strip()] or None
+MAX_EMPTY_IN_A_ROW = 2          # a board returning nothing this many times in a row is skipped for this run
+MAX_RUNTIME_MIN = 25            # hard stop for the whole run
 RESULTS_WANTED = 25
 HOURS_OLD = 36                  # >24h so a missed run loses nothing; DB de-duplicates
-SLEEP_RANGE = (4, 9)            # seconds between requests
+SLEEP_RANGE = (3, 6)            # seconds between requests
+LINKEDIN_SLEEP = (12, 20)       # LinkedIn throttles bursts
 RUN_TIMES = ["08:00", "18:00"]  # used by --daemon
 HTTP_TIMEOUT = 30
 
@@ -221,102 +228,164 @@ def from_jobspy_frame(frame, site, eu_hint):
         }
 
 
+DEADLINE = None
+
+
+def out_of_time():
+    return DEADLINE is not None and time.time() > DEADLINE
+
+
 def src_jobspy():
     from jobspy import scrape_jobs
 
+    empty_streak = {}
+
     def call(label, eu_hint, **kwargs):
+        site = kwargs["site_name"]
+        if site not in JOBSPY_SITES or out_of_time():
+            return
+        if empty_streak.get(site, 0) >= MAX_EMPTY_IN_A_ROW:
+            return                                  # blocked or empty: stop hammering this board
+        if PROXIES:
+            kwargs["proxies"] = PROXIES
         print(f"[jobspy] {label}")
         try:
             frame = scrape_jobs(**kwargs)
         except Exception as error:
             print(f"  failed: {error}")
-            pause()
-            return
-        pause()
-        yield from from_jobspy_frame(frame, kwargs["site_name"], eu_hint)
+            frame = None
+        if frame is None or frame.empty:
+            empty_streak[site] = empty_streak.get(site, 0) + 1
+            if empty_streak[site] >= MAX_EMPTY_IN_A_ROW:
+                print(f"  {site}: {MAX_EMPTY_IN_A_ROW} empty/failed calls in a row, skipping it for this run")
+        else:
+            empty_streak[site] = 0
+        time.sleep(random.uniform(*(LINKEDIN_SLEEP if site == "linkedin" else SLEEP_RANGE)))
+        yield from from_jobspy_frame(frame, site, eu_hint)
 
     for term in BOOLEAN_QUERIES:
-        for loc in LINKEDIN_LOCATIONS:
-            yield from call(f"linkedin {loc}", True, site_name="linkedin", search_term=term, location=loc,
-                            is_remote=True, results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
         for country in INDEED_COUNTRIES:
             # Indeed: hours_old can't be combined with is_remote, so "remote" goes in the query
-            yield from call(f"indeed {country}", True, site_name="indeed", search_term=f"{term} remote",
+            yield from call(f"indeed {country}", True, site_name="indeed", search_term=f"({term}) remote",
                             location=country, country_indeed=country,
                             results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
+        for loc in LINKEDIN_LOCATIONS:
+            # This JobSpy version ignores is_remote for LinkedIn, so "remote" goes in the query as well
+            yield from call(f"linkedin {loc}", True, site_name="linkedin", search_term=f"({term}) remote",
+                            location=loc, results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
         for country in GLASSDOOR_COUNTRIES:
-            yield from call(f"glassdoor {country}", True, site_name="glassdoor", search_term=f"{term} remote",
+            yield from call(f"glassdoor {country}", True, site_name="glassdoor", search_term=f"({term}) remote",
                             location=country, country_indeed=country,
                             results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
 
     for country, queries in LOCAL_QUERIES.items():
         for term in queries:
             yield from call(f"indeed {country} (local language)", True, site_name="indeed",
-                            search_term=f"{term} remote", location=country, country_indeed=country,
+                            search_term=f"({term}) remote", location=country, country_indeed=country,
                             results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
     for term in LOCAL_QUERIES.get("france", []):
         yield from call("hellowork france", True, site_name="hellowork", search_term=term,
                         location="France", results_wanted=RESULTS_WANTED, hours_old=HOURS_OLD)
 
 
-def src_adzuna():
-    app_id, app_key = os.getenv("ADZUNA_APP_ID"), os.getenv("ADZUNA_APP_KEY")
-    if not (app_id and app_key):
-        print("[adzuna] skipped: set ADZUNA_APP_ID / ADZUNA_APP_KEY (free key at developer.adzuna.com)")
-        return
-    for country in ADZUNA_COUNTRIES:
-        print(f"[adzuna] {country}")
-        words = "osint aml kyc sanctions compliance investigator linguist translator due diligence"
-        if country == "pl":
-            words += " analityk tłumacz lingwista"
-        try:
-            resp = requests.get(
-                f"https://api.adzuna.com/v1/api/jobs/{country}/search/1",
-                params={"app_id": app_id, "app_key": app_key, "what_or": words, "max_days_old": 2,
-                        "results_per_page": 50, "sort_by": "date", "content-type": "application/json"},
-                headers={"Accept": "application/json"}, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-        except Exception as error:
-            print(f"  failed: {error}")
-            pause()
+# ---------------------------------------------------------------- Polish portals (public search pages)
+PL_TERMS = ["OSINT", "AML", "KYC", "due diligence", "sanctions", "compliance analyst",
+            "analityk AML", "analityk wywiadu", "weryfikacja klienta", "tłumacz", "lingwista", "language analyst"]
+PL_PAGES = 2     # pages per search; the DB de-duplicates, 2 runs/day only need the newest
+
+# offer_re: link pattern of one offer; url(): search URL; remote_in_url: the URL already filters remote jobs
+PORTALS = {
+    "Pracuj.pl": {
+        "url": lambda t, p: f"https://www.pracuj.pl/praca/{quote(t)};kw/zdalna;wm,home-office" + (f"?pn={p}" if p > 1 else ""),
+        "offer_re": re.compile(r",oferta,\d+"), "remote_in_url": True},
+    "JustJoin.it": {
+        "url": lambda t, p: f"https://justjoin.it/job-offers/all-locations?keyword={quote(t)}&workplace-type=remote&page={p}",
+        "offer_re": re.compile(r"/job-offer/[\w-]+"), "remote_in_url": False},
+    "RocketJobs.pl": {
+        "url": lambda t, p: f"https://rocketjobs.pl/oferty-pracy/wszystkie-lokalizacje?keyword={quote(t)}&strona={p}",
+        "offer_re": re.compile(r"/oferta-pracy/[\w-]+"), "remote_in_url": False},
+    "Jooble.pl": {
+        "url": lambda t, p: f"https://pl.jooble.org/praca-{quote(t.lower().replace(' ', '-'))}/Zdalna" + (f"?p={p}" if p > 1 else ""),
+        "offer_re": re.compile(r"/jdp/-?\d+"), "remote_in_url": True},
+}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
+}
+
+
+def _attr_text(container, word):
+    """First descendant whose attributes mention `word` (e.g. 'company', 'location') -> its text."""
+    for tag in container.find_all(True):
+        blob = " ".join(str(v) for v in tag.attrs.values()).lower()
+        if word in blob and tag.get_text(strip=True):
+            return tag.get_text(" ", strip=True)[:120]
+    return ""
+
+
+def parse_offers(html, base_url, cfg, site):
+    """Generic extraction: every link matching the portal's offer pattern is one job; its card gives the context."""
+    soup = BeautifulSoup(html, "html.parser")
+    seen, rows = set(), []
+    for a in soup.find_all("a", href=True):
+        if not cfg["offer_re"].search(a["href"]):
             continue
-        pause()
-        for r in results:
-            yield {
-                "title": _clean(r.get("title")), "company": _clean((r.get("company") or {}).get("display_name")),
-                "location": _clean((r.get("location") or {}).get("display_name")), "site": "Adzuna",
-                "job_url": _clean(r.get("redirect_url")), "date_posted": _clean(r.get("created")),
-                "description": _clean(r.get("description")), "is_remote": None, "eu_hint": True,
-            }
+        url = urljoin(base_url, a["href"]).split("#")[0]
+        if url in seen:
+            continue
+        seen.add(url)
+        card = a
+        for _ in range(6):      # climb while the card still holds only this offer's link
+            parent = card.parent
+            if parent is None or len({x["href"] for x in parent.find_all("a", href=cfg["offer_re"])}) > 1:
+                break
+            card = parent
+        text = card.get_text(" ", strip=True)
+        heading = card.find(["h1", "h2", "h3", "h4"])
+        title = (a.get_text(" ", strip=True) if len(a.get_text(strip=True)) > 3 else
+                 heading.get_text(" ", strip=True) if heading else "")
+        if not title:
+            slug = url.rstrip("/").split("/")[-1].split(",")[0]
+            title = slug.replace("-", " ")
+        rows.append({
+            "title": title[:200], "company": _attr_text(card, "company"), "location": _attr_text(card, "location"),
+            "site": site, "job_url": url, "date_posted": "", "description": text[:3000],
+            "is_remote": True if cfg["remote_in_url"] else None, "eu_hint": True,
+        })
+    return rows
 
 
-def src_jooble():
-    key = os.getenv("JOOBLE_API_KEY")
-    if not key:
-        print("[jooble] skipped: set JOOBLE_API_KEY (free key at jooble.org/api/about)")
+def src_portals_pl():
+    if BeautifulSoup is None:
+        print("[portals_pl] skipped: pip install beautifulsoup4")
         return
-    for location in JOOBLE_LOCATIONS:
-        for term in SIMPLE_TERMS:
-            print(f"[jooble] {location}: {term}")
-            try:
-                resp = requests.post(f"https://jooble.org/api/{key}",
-                                     json={"keywords": f"{term} remote", "location": location, "page": 1},
-                                     timeout=HTTP_TIMEOUT)
-                resp.raise_for_status()
-                results = resp.json().get("jobs", [])
-            except Exception as error:
-                print(f"  failed: {error}")
-                pause()
-                continue
-            pause()
-            for r in results:
-                yield {
-                    "title": _clean(r.get("title")), "company": _clean(r.get("company")),
-                    "location": _clean(r.get("location")), "site": "Jooble",
-                    "job_url": _clean(r.get("link")), "date_posted": _clean(r.get("updated")),
-                    "description": _clean(r.get("snippet")), "is_remote": None, "eu_hint": True,
-                }
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    for site, cfg in PORTALS.items():
+        empty = 0
+        for term in PL_TERMS:
+            for page in range(1, PL_PAGES + 1):
+                if out_of_time() or empty >= MAX_EMPTY_IN_A_ROW:
+                    break
+                url = cfg["url"](term, page)
+                print(f"[{site}] {term} p{page}")
+                rows = []
+                try:
+                    resp = session.get(url, timeout=HTTP_TIMEOUT)
+                    if resp.status_code != 200:
+                        print(f"  HTTP {resp.status_code} (blocked or changed)")
+                    else:
+                        rows = parse_offers(resp.text, url, cfg, site)
+                except Exception as error:
+                    print(f"  failed: {error}")
+                empty = 0 if rows else empty + 1
+                if empty >= MAX_EMPTY_IN_A_ROW:
+                    print(f"  {site}: nothing returned {MAX_EMPTY_IN_A_ROW}x in a row, skipping it for this run")
+                time.sleep(random.uniform(*SLEEP_RANGE))
+                yield from rows
+                if not rows:
+                    break       # no point asking for page 2
 
 
 def src_arbeitnow():
@@ -365,8 +434,7 @@ def src_remotive():
         break   # a single request per run keeps us at 2/day
 
 
-ADAPTERS = {"jobspy": src_jobspy, "adzuna": src_adzuna, "jooble": src_jooble,
-            "arbeitnow": src_arbeitnow, "remotive": src_remotive}
+ADAPTERS = {"jobspy": src_jobspy, "portals_pl": src_portals_pl, "arbeitnow": src_arbeitnow, "remotive": src_remotive}
 
 
 # ---------------------------------------------------------------- pipeline
@@ -407,6 +475,8 @@ def write_csv(jobs):
 
 
 def scrape():
+    global DEADLINE
+    DEADLINE = time.time() + MAX_RUNTIME_MIN * 60
     print(f"=== Run started {datetime.now():%Y-%m-%d %H:%M} ===")
     connection = initialize_database()
     all_new = []
