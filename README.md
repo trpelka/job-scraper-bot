@@ -81,14 +81,38 @@ The daemon scrapes at `08:00` and `18:00` local time. On Windows, two Task Sched
 found_at, title, company, location, site, date_posted, job_url
 ```
 
-SQLite (`local_jobs.db`) keeps two tables:
+The CSV is a rolling **7-day** feed (`CSV_RETENTION_DAYS`, default `7`). Rows older than the window — and legacy rows without a usable `found_at` — are dropped on every run.
+
+SQLite (`local_jobs.db`) keeps the full de-duplication history and lives on the `data` branch, not in `main`:
 
 - `seen_jobs` — normalized `job_url` primary key, plus title/company/location/site/found_at
 - `seen_keys` — normalized `title + company` keys, used to catch re-posts under a new URL
 
-Delete both files to start with a clean slate.
+Delete `local_jobs.db` locally or delete the `data` branch to start with a clean slate.
 
 `reports/latest.md` summarises the latest run (mode, new-job count, per-source table, up to 25 new listings). It is git-ignored and uploaded as a workflow artifact; the contents are also appended to the GitHub Actions step summary.
+
+## Data and storage
+
+Two files are deliberately separated:
+
+| Data | Where | Size (typical) | Why |
+| --- | --- | --- | --- |
+| `jobs.csv` | `main`, rolling 7 days | ~9 KB | Human-readable feed, cheap to commit |
+| `local_jobs.db` | `data` branch, single rolling commit | ~0.3 MB | Full de-duplication history without growing `main` |
+
+The `data` branch is rewritten with `git push --force` on every run, so it always contains exactly one commit and one database file. Its storage footprint is the size of the current database, not its history.
+
+Why not Actions cache? The cache is limited to **10 GB per repository**, entries are evicted after **7 days without access**, and there is no API to seed it. The rolling `data` branch has no eviction, survives pauses in the schedule, and is inspectable.
+
+For reference, on GitHub Free:
+
+- **Actions minutes and storage are free for public repositories** (2,000 minutes/month and 500 MB storage are the private-repo allowances).
+- **Actions cache:** 10 GB per repository, entries expire after 7 days unused.
+- **Artifacts:** 90-day default retention; here only the tiny Markdown report is uploaded.
+- **Repository:** GitHub recommends staying under 1 GB; files over 100 MB trigger a warning and pushes over 2 GB are blocked.
+
+Old blobs already in `main` history are not reclaimed by deleting the file now; that would require a history rewrite, which is not done here.
 
 ## Configuration
 
@@ -115,6 +139,7 @@ Several of them can be overridden without editing code:
 | `RESULTS_WANTED` | `25` |
 | `HOURS_OLD` | `36` |
 | `HTTP_TIMEOUT` | `30` |
+| `CSV_RETENTION_DAYS` | `7` |
 | `RUN_TIMES` | `08:00,18:00` |
 | `JOBSPY_PROXIES` | empty |
 
@@ -122,7 +147,7 @@ Filters are regexes (`RELEVANT`, `TOPICAL`, `BLOCKED_PLACE`, `BLOCKED_ELIGIBILIT
 
 ## Automation
 
-`.github/workflows/run.yml` runs at `06:00` and `16:00` UTC (08:00 / 18:00 Warsaw summer time), commits `jobs.csv` and `local_jobs.db` back to the repo, writes a step summary, uploads the report and can be started manually from the **Actions** tab.
+`.github/workflows/run.yml` runs at `06:00` and `16:00` UTC (08:00 / 18:00 Warsaw summer time). It restores `local_jobs.db` from the `data` branch, commits the rolling 7-day `jobs.csv` to `main`, force-pushes the updated database back to `data`, writes a step summary, uploads the report and can be started manually from the **Actions** tab.
 
 After the October DST change, switch the cron to `0 7,17 * * *` for the same local times.
 
@@ -136,7 +161,7 @@ ruff check .
 pytest
 ```
 
-The tests cover URL normalization, title/company keys, eligibility filtering, HTML offer parsing, dry-run CSV behaviour and daemon timing. They do not touch the network.
+The tests cover URL normalization, title/company keys, eligibility filtering, HTML offer parsing, 7-day CSV retention, dry-run CSV behaviour and daemon timing. They do not touch the network.
 
 ## Limitations
 
@@ -144,5 +169,5 @@ The tests cover URL normalization, title/company keys, eligibility filtering, HT
 - LinkedIn/Glassdoor results are unreliable from cloud IPs; use a proxy or run locally.
 - Only remote roles are kept by design.
 - Descriptions are truncated before filtering to keep the run fast.
-- The CSV grows forever; prune it or move to a proper database if you need long-term analytics.
-- `jobs.csv` and `local_jobs.db` are committed to the repository. For long-term use, move them to an actions cache or a separate data branch.
+- The 7-day CSV is a feed, not an archive; use the `data` branch database if you need long-term analytics.
+- `local_jobs.db` grows with every new URL. It is kept out of `main`, but the `data` branch will grow over years; prune `seen_jobs` if that ever matters.

@@ -75,6 +75,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "local_jobs.db"
 CSV_FILE = BASE_DIR / "jobs.csv"
 REPORT_FILE = BASE_DIR / "reports" / "latest.md"
+CSV_RETENTION_DAYS = int(os.getenv("CSV_RETENTION_DAYS", "7"))
 TRACKING_PARAMS = {
     "gclid", "fbclid", "igshid", "mc_cid", "mc_eid",
     "ref", "referrer", "source", "trk",
@@ -504,6 +505,21 @@ def process(rows, connection, stats=None, dry_run=False):
     return new_jobs
 
 
+def recent_rows(rows, days=None):
+    """Drop rows outside the CSV retention window; rows without a usable timestamp are dropped too."""
+    days = CSV_RETENTION_DAYS if days is None else days
+    cutoff = datetime.now() - timedelta(days=days)
+    kept = []
+    for row in rows:
+        try:
+            found_at = datetime.strptime(str(row.get("found_at", "")), "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            continue
+        if found_at >= cutoff:
+            kept.append(row)
+    return kept
+
+
 def write_csv(jobs, dry_run=False):
     fieldnames = ["found_at", "title", "company", "location", "site", "date_posted", "job_url"]
     existing = []
@@ -515,6 +531,7 @@ def write_csv(jobs, dry_run=False):
         if job["job_url"] not in seen:
             existing.append(job)
             seen.add(job["job_url"])
+    existing = recent_rows(existing)
     if dry_run:
         print(f"\nDRY RUN: CSV not written ({len(existing)} jobs would be present)")
         return len(existing)

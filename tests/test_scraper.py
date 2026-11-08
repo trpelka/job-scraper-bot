@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta
 
 import scraper
 
@@ -72,7 +73,7 @@ def test_parse_offers_extracts_one_job_per_offer_link():
 def test_write_csv_dry_run_dedupes_and_does_not_write(tmp_path, monkeypatch):
     monkeypatch.setattr(scraper, "CSV_FILE", tmp_path / "jobs.csv")
     job = {
-        "found_at": "2026-01-01 08:00",
+        "found_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "title": "AML Analyst",
         "company": "ACME",
         "location": "Poland",
@@ -89,3 +90,14 @@ def test_write_csv_dry_run_dedupes_and_does_not_write(tmp_path, monkeypatch):
 
 def test_seconds_until_next_run_is_positive():
     assert scraper.seconds_until_next_run() > 0
+
+
+def test_recent_rows_drops_old_and_unparseable_rows():
+    now = datetime.now()
+    rows = [
+        {"found_at": (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M")},
+        {"found_at": (now - timedelta(days=10)).strftime("%Y-%m-%d %H:%M")},
+        {"found_at": ""},
+    ]
+
+    assert len(scraper.recent_rows(rows, days=7)) == 1

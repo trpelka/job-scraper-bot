@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write              # lets the job commit jobs.csv / local_jobs.db back to the repo
+  contents: write              # commits the 7-day CSV to main and the database to the `data` branch
 
 concurrency:
   group: job-scraper
@@ -19,6 +19,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Restore de-duplication database
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth=1 origin data
+            git show origin/data:local_jobs.db > local_jobs.db
+            echo "Restored database ($(du -h local_jobs.db | cut -f1))."
+          else
+            echo "No data branch yet; starting with an empty database."
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -36,6 +46,7 @@ jobs:
           MAX_RUNTIME_MIN: "25"
           RESULTS_WANTED: "25"
           HOURS_OLD: "36"
+          CSV_RETENTION_DAYS: "7"
         run: python scraper.py
 
       - name: Publish run summary
@@ -45,15 +56,32 @@ jobs:
             cat reports/latest.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Save results (keeps the de-duplication DB between runs)
+      - name: Persist de-duplication database
+        if: always()
+        run: |
+          if [ ! -f local_jobs.db ]; then
+            echo "No database to persist."
+            exit 0
+          fi
+          rm -rf "$RUNNER_TEMP/job-data"
+          git init -q -b data "$RUNNER_TEMP/job-data"
+          cp local_jobs.db "$RUNNER_TEMP/job-data/"
+          cd "$RUNNER_TEMP/job-data"
+          git add local_jobs.db
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "data $(date -u +'%Y-%m-%d %H:%M')"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
+
+      - name: Save recent jobs
         run: |
           git config user.name  "job-scraper"
           git config user.email "job-scraper@users.noreply.github.com"
-          git add jobs.csv local_jobs.db
+          git add jobs.csv
           if git diff --staged --quiet; then
             echo "No changes to save."
           else
-            git commit -m "Update jobs $(date -u +'%Y-%m-%d %H:%M')"
+            git commit -m "Update recent jobs $(date -u +'%Y-%m-%d %H:%M')"
             git push
           fi
 
