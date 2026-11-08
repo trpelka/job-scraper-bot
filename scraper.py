@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import requests
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 try:
     from bs4 import BeautifulSoup
@@ -36,7 +36,7 @@ except ImportError:          # portals_pl needs: pip install beautifulsoup4
     BeautifulSoup = None
 
 # ---------------------------------------------------------------- settings
-SOURCES = ["jobspy", "portals_pl", "arbeitnow", "remotive"]
+SOURCES = [s.strip() for s in os.getenv("SOURCES", "jobspy,portals_pl,arbeitnow,remotive").split(",") if s.strip()]
 
 # JobSpy boolean queries (one call covers many terms)
 BOOLEAN_QUERIES = [
@@ -63,17 +63,22 @@ GLASSDOOR_COUNTRIES = ["germany", "netherlands", "ireland", "spain", "france", "
 JOBSPY_SITES = ["indeed", "linkedin"]          # add "glassdoor" / "hellowork" if you run locally or use proxies
 PROXIES = [p.strip() for p in os.getenv("JOBSPY_PROXIES", "").split(",") if p.strip()] or None
 MAX_EMPTY_IN_A_ROW = 2          # a board returning nothing this many times in a row is skipped for this run
-MAX_RUNTIME_MIN = 25            # hard stop for the whole run
-RESULTS_WANTED = 25
-HOURS_OLD = 36                  # >24h so a missed run loses nothing; DB de-duplicates
+MAX_RUNTIME_MIN = int(os.getenv("MAX_RUNTIME_MIN", "25"))   # hard stop for the whole run
+RESULTS_WANTED = int(os.getenv("RESULTS_WANTED", "25"))
+HOURS_OLD = int(os.getenv("HOURS_OLD", "36"))   # >24h so a missed run loses nothing; DB de-duplicates
 SLEEP_RANGE = (3, 6)            # seconds between requests
 LINKEDIN_SLEEP = (12, 20)       # LinkedIn throttles bursts
-RUN_TIMES = ["08:00", "18:00"]  # used by --daemon
-HTTP_TIMEOUT = 30
+RUN_TIMES = [t.strip() for t in os.getenv("RUN_TIMES", "08:00,18:00").split(",") if t.strip()]
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "local_jobs.db"
 CSV_FILE = BASE_DIR / "jobs.csv"
+REPORT_FILE = BASE_DIR / "reports" / "latest.md"
+TRACKING_PARAMS = {
+    "gclid", "fbclid", "igshid", "mc_cid", "mc_eid",
+    "ref", "referrer", "source", "trk",
+}
 
 # ---------------------------------------------------------------- filters
 RELEVANT = re.compile(
@@ -214,6 +219,47 @@ def _clean(value):
     return "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
 
 
+def normalize_url(url):
+    """Lower-case the host, drop tracking parameters and fragments, strip a trailing slash.
+
+    Job boards append utm_* and other per-view parameters, so the same offer otherwise
+    looks like several different jobs and defeats both de-duplication layers.
+    """
+    if not url:
+        return ""
+    parsed = urlparse(str(url).strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(url).strip()
+    query = urlencode([
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in TRACKING_PARAMS and not key.lower().startswith("utm_")
+    ])
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
+
+
+def http_get(session, url, params=None, attempts=3):
+    """GET with retries and exponential backoff for 429/5xx and network errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if response.status_code == 429 or response.status_code >= 500:
+                raise requests.HTTPError(f"HTTP {response.status_code}")
+            if response.status_code >= 400:
+                print(f"  HTTP {response.status_code} (blocked or changed)")
+                return None
+            return response
+        except Exception as error:
+            if attempt == attempts:
+                print(f"  failed after {attempts} attempts: {error}")
+                return None
+            backoff = 2 ** attempt + random.uniform(0, 1)
+            print(f"  failed ({error}); retrying in {backoff:.1f}s")
+            time.sleep(backoff)
+    return None
+
+
 def from_jobspy_frame(frame, site, eu_hint):
     if frame is None or frame.empty:
         return
@@ -331,7 +377,7 @@ def parse_offers(html, base_url, cfg, site):
     for a in soup.find_all("a", href=True):
         if not cfg["offer_re"].search(a["href"]):
             continue
-        url = urljoin(base_url, a["href"]).split("#")[0]
+        url = normalize_url(urljoin(base_url, a["href"]))
         if url in seen:
             continue
         seen.add(url)
@@ -371,14 +417,12 @@ def src_portals_pl():
                 url = cfg["url"](term, page)
                 print(f"[{site}] {term} p{page}")
                 rows = []
-                try:
-                    resp = session.get(url, timeout=HTTP_TIMEOUT)
-                    if resp.status_code != 200:
-                        print(f"  HTTP {resp.status_code} (blocked or changed)")
-                    else:
+                resp = http_get(session, url)
+                if resp is not None:
+                    try:
                         rows = parse_offers(resp.text, url, cfg, site)
-                except Exception as error:
-                    print(f"  failed: {error}")
+                    except Exception as error:
+                        print(f"  parse failed: {error}")
                 empty = 0 if rows else empty + 1
                 if empty >= MAX_EMPTY_IN_A_ROW:
                     print(f"  {site}: nothing returned {MAX_EMPTY_IN_A_ROW}x in a row, skipping it for this run")
@@ -392,9 +436,9 @@ def src_arbeitnow():
     print("[arbeitnow] page 1-3")
     for page in (1, 2, 3):
         try:
-            resp = requests.get("https://www.arbeitnow.com/api/job-board-api", params={"page": page},
-                                timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
+            resp = http_get(requests, "https://www.arbeitnow.com/api/job-board-api", params={"page": page})
+            if resp is None:
+                return
             results = resp.json().get("data", [])
         except Exception as error:
             print(f"  failed: {error}")
@@ -416,9 +460,9 @@ def src_remotive():
     print("[remotive] search")
     for term in ("osint", "compliance", "analyst"):
         try:
-            resp = requests.get("https://remotive.com/api/remote-jobs", params={"search": term},
-                                timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
+            resp = http_get(requests, "https://remotive.com/api/remote-jobs", params={"search": term})
+            if resp is None:
+                return
             results = resp.json().get("jobs", [])
         except Exception as error:
             print(f"  failed: {error}")
@@ -438,57 +482,94 @@ ADAPTERS = {"jobspy": src_jobspy, "portals_pl": src_portals_pl, "arbeitnow": src
 
 
 # ---------------------------------------------------------------- pipeline
-def process(rows, connection):
+def process(rows, connection, stats=None, dry_run=False):
     new_jobs = []
+    stats = stats if stats is not None else {}
     for row in rows:
-        url, title, company = row["job_url"], row["title"], row["company"]
+        url = normalize_url(row["job_url"])
+        title, company = row["title"], row["company"]
         if not url or not title:
             continue
         key = job_key(title, company)
         if job_seen(connection, url, key) or not keep_job(row):
             continue
-        save_job(connection, url, key, title, company, row["location"], row["site"])
+        if not dry_run:
+            save_job(connection, url, key, title, company, row["location"], row["site"])
         job = {"found_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "title": title, "company": company,
                "location": row["location"], "site": row["site"], "date_posted": row["date_posted"],
                "job_url": url}
         new_jobs.append(job)
-        print(f"  NEW [{row['site']}] {title} | {company} | {row['location']}\n      {url}")
+        stats[row["site"]] = stats.get(row["site"], 0) + 1
+        print(f"  {'WOULD ADD' if dry_run else 'NEW'} [{row['site']}] {title} | {company} | {row['location']}\n      {url}")
     return new_jobs
 
 
-def write_csv(jobs):
+def write_csv(jobs, dry_run=False):
     fieldnames = ["found_at", "title", "company", "location", "site", "date_posted", "job_url"]
     existing = []
     if CSV_FILE.exists():
         with CSV_FILE.open("r", newline="", encoding="utf-8") as f:
             existing = list(csv.DictReader(f))
-    seen = {j.get("job_url", "") for j in existing}
+    seen = {normalize_url(j.get("job_url", "")) for j in existing}
     for job in jobs:
         if job["job_url"] not in seen:
             existing.append(job)
             seen.add(job["job_url"])
+    if dry_run:
+        print(f"\nDRY RUN: CSV not written ({len(existing)} jobs would be present)")
+        return len(existing)
+    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
     with CSV_FILE.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(existing)
     print(f"\nCSV saved: {CSV_FILE} ({len(existing)} total jobs)")
+    return len(existing)
 
 
-def scrape():
+def write_report(new_jobs, stats, total, dry_run=False):
+    REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Job scraper - latest run",
+        "",
+        f"- Run: {datetime.now():%Y-%m-%d %H:%M}",
+        f"- Mode: {'dry run (nothing saved)' if dry_run else 'live'}",
+        f"- New jobs: {len(new_jobs)}",
+        f"- Total in CSV: {total}",
+        "",
+    ]
+    if stats:
+        lines += ["## New jobs by source", "", "| Source | New |", "| --- | --- |"]
+        for site, count in sorted(stats.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"| {site} | {count} |")
+        lines += [""]
+    if new_jobs:
+        lines += ["## Newest jobs", ""]
+        for job in new_jobs[:25]:
+            lines.append(f"- **{job['title']}** - {job['company'] or 'unknown company'} "
+                         f"({job['location'] or 'no location'}) - {job['job_url']}")
+        lines += [""]
+    REPORT_FILE.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Report: {REPORT_FILE}")
+
+
+def scrape(dry_run=False):
     global DEADLINE
     DEADLINE = time.time() + MAX_RUNTIME_MIN * 60
     print(f"=== Run started {datetime.now():%Y-%m-%d %H:%M} ===")
     connection = initialize_database()
     all_new = []
+    stats = {}
     try:
         for name in SOURCES:
             try:
-                all_new += process(ADAPTERS[name](), connection)
+                all_new += process(ADAPTERS[name](), connection, stats, dry_run=dry_run)
             except Exception as error:      # one broken source must not stop the others
                 print(f"[{name}] source failed: {error}")
     finally:
         connection.close()
-    write_csv(all_new)
+    total = write_csv(all_new, dry_run=dry_run)
+    write_report(all_new, stats, total, dry_run=dry_run)
     print(f"Finished. {len(all_new)} new jobs.")
 
 
@@ -504,20 +585,33 @@ def seconds_until_next_run(now=None):
     return (min(candidates) - now).total_seconds()
 
 
-def daemon():
+def daemon(dry_run=False):
     while True:
         wait = seconds_until_next_run()
         print(f"Next run in {wait/3600:.1f} h (times: {', '.join(RUN_TIMES)})")
         time.sleep(wait)
         try:
-            scrape()
+            scrape(dry_run=dry_run)
         except Exception as error:
             print(f"Run failed: {error}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Scrape remote OSINT / AML-KYC / language roles open to EU candidates.")
     parser.add_argument("--daemon", action="store_true", help="keep running, scrape at RUN_TIMES")
+    parser.add_argument("--dry-run", action="store_true", help="collect and report without writing the database or CSV")
+    parser.add_argument("--sources", help="comma-separated subset of: " + ", ".join(ADAPTERS))
+    parser.add_argument("--max-runtime", type=int, help=f"hard stop in minutes (default {MAX_RUNTIME_MIN})")
     args = parser.parse_args()
+
+    if args.max_runtime:
+        MAX_RUNTIME_MIN = args.max_runtime
+
+    if args.sources:
+        SOURCES = [name.strip() for name in args.sources.split(",") if name.strip()]
+        unknown = set(SOURCES) - set(ADAPTERS)
+        if unknown:
+            parser.error(f"unknown sources: {', '.join(sorted(unknown))}")
+
     configure_geocoder()
-    daemon() if args.daemon else scrape()
+    daemon(dry_run=args.dry_run) if args.daemon else scrape(dry_run=args.dry_run)

@@ -14,7 +14,7 @@ Most remote-job feeds are full of US-only listings and reposted duplicates. This
 - **No blocked locations** — US, UK, Canada, India, Philippines, Singapore, Brazil, Mexico, Australia, APAC, LATAM and US-state patterns are rejected
 - **No US/UK-only eligibility language** — "US-only", "must reside in the US", "security clearance", etc.
 
-It also rejects jobs it has already seen, both by URL and by a normalized `title + company` key, so cross-posted listings do not create noise.
+It also rejects jobs it has already seen, both by normalized URL and by a normalized `title + company` key, so cross-posted listings do not create noise.
 
 ## Sources
 
@@ -25,7 +25,7 @@ It also rejects jobs it has already seen, both by URL and by a normalized `title
 | `arbeitnow` | public job-board API, Germany/EU, remote flag |
 | `remotive` | public remote-jobs API, one request per run to respect their limits |
 
-LinkedIn and Glassdoor frequently block datacenter IPs (HTTP 429/403), especially on GitHub Actions. The scraper detects a board returning nothing repeatedly and skips it for the rest of the run instead of hammering it. Set proxies to improve results:
+LinkedIn and Glassdoor frequently block datacenter IPs (HTTP 429/403), especially on GitHub Actions. The scraper detects a board returning nothing repeatedly and skips it for the rest of the run instead of hammering it. HTTP calls retry transient failures with exponential backoff. Set proxies to improve results:
 
 ```bash
 # Windows PowerShell
@@ -38,11 +38,28 @@ python scraper.py
 ```bash
 git clone https://github.com/trpelka/job-scraper-bot.git
 cd job-scraper-bot
-pip install -U python-jobspy pandas requests beautifulsoup4
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
 python scraper.py
 ```
 
 Run once, print new matches, append them to `jobs.csv` and store them in `local_jobs.db`.
+
+### Command line
+
+```bash
+python scraper.py --dry-run                     # collect and report, change nothing
+python scraper.py --sources arbeitnow,remotive  # run only selected adapters
+python scraper.py --max-runtime 10              # hard stop after 10 minutes
+```
+
+Adapter keys: `jobspy`, `portals_pl`, `arbeitnow`, `remotive`.
 
 ### Run it twice a day
 
@@ -66,14 +83,16 @@ found_at, title, company, location, site, date_posted, job_url
 
 SQLite (`local_jobs.db`) keeps two tables:
 
-- `seen_jobs` — `job_url` primary key, plus title/company/location/site/found_at
+- `seen_jobs` — normalized `job_url` primary key, plus title/company/location/site/found_at
 - `seen_keys` — normalized `title + company` keys, used to catch re-posts under a new URL
 
 Delete both files to start with a clean slate.
 
+`reports/latest.md` summarises the latest run (mode, new-job count, per-source table, up to 25 new listings). It is git-ignored and uploaded as a workflow artifact; the contents are also appended to the GitHub Actions step summary.
+
 ## Configuration
 
-Tunable constants live near the top of `scraper.py`:
+Constants live near the top of `scraper.py`:
 
 | Constant | Purpose |
 | --- | --- |
@@ -85,14 +104,39 @@ Tunable constants live near the top of `scraper.py`:
 | `MAX_RUNTIME_MIN` | Hard stop for the whole run (default 25 min) |
 | `SLEEP_RANGE`, `LINKEDIN_SLEEP` | Delay between requests |
 | `RUN_TIMES` | Times used by `--daemon` |
+| `HTTP_TIMEOUT` | Per-request timeout |
+
+Several of them can be overridden without editing code:
+
+| Variable | Default |
+| --- | --- |
+| `SOURCES` | `jobspy,portals_pl,arbeitnow,remotive` |
+| `MAX_RUNTIME_MIN` | `25` |
+| `RESULTS_WANTED` | `25` |
+| `HOURS_OLD` | `36` |
+| `HTTP_TIMEOUT` | `30` |
+| `RUN_TIMES` | `08:00,18:00` |
+| `JOBSPY_PROXIES` | empty |
 
 Filters are regexes (`RELEVANT`, `TOPICAL`, `BLOCKED_PLACE`, `BLOCKED_ELIGIBILITY`) and can be edited the same way.
 
 ## Automation
 
-`.github/workflows/run.yml` runs at `06:00` and `16:00` UTC (08:00 / 18:00 Warsaw summer time), commits `jobs.csv` and `local_jobs.db` back to the repo, and can be started manually from the **Actions** tab.
+`.github/workflows/run.yml` runs at `06:00` and `16:00` UTC (08:00 / 18:00 Warsaw summer time), commits `jobs.csv` and `local_jobs.db` back to the repo, writes a step summary, uploads the report and can be started manually from the **Actions** tab.
 
 After the October DST change, switch the cron to `0 7,17 * * *` for the same local times.
+
+`ci.yml` runs linting and the test suite on every push and pull request. Dependabot keeps Python and GitHub Actions dependencies up to date.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
+
+The tests cover URL normalization, title/company keys, eligibility filtering, HTML offer parsing, dry-run CSV behaviour and daemon timing. They do not touch the network.
 
 ## Limitations
 
@@ -101,3 +145,4 @@ After the October DST change, switch the cron to `0 7,17 * * *` for the same loc
 - Only remote roles are kept by design.
 - Descriptions are truncated before filtering to keep the run fast.
 - The CSV grows forever; prune it or move to a proper database if you need long-term analytics.
+- `jobs.csv` and `local_jobs.db` are committed to the repository. For long-term use, move them to an actions cache or a separate data branch.
